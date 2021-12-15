@@ -13,14 +13,17 @@
 - Supports DNS callback for vulnerability discovery and validation.
 - WAF Bypass payloads.
 
+Added:
+- Asynchronous requests for a significant performance boost when scanning multiple hosts
+- Slightly enhanced payloads
+- A little cleaner logging
+- Throttling for requests (which doesn't quite work, I've to assume - semaphore behaves weird...)
+
 # Description
 
 We have been researching the Log4J RCE (CVE-2021-44228) since it was released, and we worked in preventing this vulnerability with our customers. We are open-sourcing an open detection and scanning tool for discovering and fuzzing for Log4J RCE CVE-2021-44228 vulnerability. This shall be used by security teams to scan their infrastructure for Log4J RCE, and also test for WAF bypasses that can result in achiving code execution on the organization's environment.
 
 It supports DNS OOB callbacks out of the box, there is no need to setup a DNS callback server.
-
-
-
 
 
 # Usage
@@ -56,6 +59,8 @@ optional arguments:
                         Custom DNS Callback Host.
   --disable-http-redirects
                         Disable HTTP redirects. Note: HTTP redirects are useful as it allows the payloads to have higher chance of reaching vulnerable systems.
+  --max-tasks MAX_TASKS
+                        Maximum amount of concurrent requests running at the same time (default 10).
 ```
 
 ## Scan a Single URL
